@@ -622,65 +622,119 @@ function toggleConfig(force) {
   panel.classList.toggle('visible', show);
 }
 
-// ── PS4 GAMEPAD API ──
-let gamepads = {};
-let gamepadLoop = null;
+// ── PS4 GAMEPAD API (Android Chrome/Brave fix) ──
+let gpConnected = false;
+let gpLoop = null;
+let circlePrev = false;
+let touchUnlocked = false;
 
+// Android Chrome exige un appui tactile avant de donner accès au gamepad
+function unlockGamepad() {
+  if (!touchUnlocked) {
+    touchUnlocked = true;
+    startGpScan();
+  }
+}
+document.addEventListener('touchstart', unlockGamepad, { once: true });
+document.addEventListener('click', unlockGamepad, { once: true });
+
+// Scan actif toutes les 200ms pour détecter la manette (Android ne fire pas toujours gamepadconnected)
+function startGpScan() {
+  if (gpLoop) return;
+  gpLoop = setInterval(() => {
+    const gps = navigator.getGamepads ? Array.from(navigator.getGamepads()).filter(Boolean) : [];
+    if (gps.length > 0) {
+      if (!gpConnected) {
+        gpConnected = true;
+        document.getElementById('dot-ps4').className = 'dot on';
+        document.getElementById('lbl-ps4').className = 'status-label on';
+        document.getElementById('lbl-ps4').textContent = 'PS4 OK';
+      }
+      pollGamepad(gps[0]);
+    } else {
+      if (gpConnected) {
+        gpConnected = false;
+        document.getElementById('dot-ps4').className = 'dot warn';
+        document.getElementById('lbl-ps4').className = 'status-label warn';
+        document.getElementById('lbl-ps4').textContent = 'PS4 --';
+        throttle = 0; steering = 0;
+        updateThrottleDisplay(); updateSteeringDisplay();
+      }
+    }
+  }, 50);
+}
+
+// Aussi écouter l'événement standard si le navigateur le supporte
 window.addEventListener('gamepadconnected', (e) => {
-  gamepads[e.gamepad.index] = true;
-  setStatus('ps4', true, 'PS4 OK');
+  gpConnected = true;
   document.getElementById('dot-ps4').className = 'dot on';
   document.getElementById('lbl-ps4').className = 'status-label on';
-  if (!gamepadLoop) gamepadLoop = setInterval(pollGamepad, 50);
+  document.getElementById('lbl-ps4').textContent = 'PS4 OK';
+  startGpScan();
+});
+window.addEventListener('gamepaddisconnected', () => {
+  gpConnected = false;
+  document.getElementById('dot-ps4').className = 'dot warn';
+  document.getElementById('lbl-ps4').className = 'status-label warn';
+  document.getElementById('lbl-ps4').textContent = 'PS4 --';
 });
 
-window.addEventListener('gamepaddisconnected', (e) => {
-  delete gamepads[e.gamepad.index];
-  if (Object.keys(gamepads).length === 0) {
-    setStatus('ps4', false, 'PS4 --');
-    document.getElementById('dot-ps4').className = 'dot warn';
-    document.getElementById('lbl-ps4').className = 'status-label warn';
-    clearInterval(gamepadLoop); gamepadLoop = null;
-  }
-});
-
-function pollGamepad() {
-  const gp = navigator.getGamepads ? navigator.getGamepads()[0] : null;
+function pollGamepad(gp) {
   if (!gp) return;
 
-  // PS4: Left stick Y = axis[1], Right stick X = axis[2]
-  const rawThrottle = -gp.axes[1]; // invert Y
-  const rawSteering = gp.axes[2];
+  // ── Axes PS4 sur Android ──
+  // axis[0] = stick gauche X, axis[1] = stick gauche Y (↑ négatif)
+  // axis[2] = stick droit  X, axis[3] = stick droit  Y
+  // buttons[6] = L2, buttons[7] = R2  (value 0..1)
 
-  // Deadzone 0.1
-  const deadzone = 0.1;
-  throttle = Math.abs(rawThrottle) > deadzone ? Math.round(rawThrottle * 100) : 0;
-  steering = Math.abs(rawSteering) > deadzone ? Math.round(rawSteering * 100) : 0;
+  const deadzone = 0.12;
 
-  // R2 = gas, L2 = brake (axes[5] / axes[4] on PS4)
-  const gas = (gp.axes[5] + 1) / 2;   // 0..1
-  const brake = (gp.axes[4] + 1) / 2;
-  if (gas > 0.05 || brake > 0.05) {
-    throttle = Math.round((gas - brake) * 100);
+  // Gaz/frein via stick gauche Y
+  const rawT = -(gp.axes[1] || 0);
+  let newThrottle = Math.abs(rawT) > deadzone ? Math.round(rawT * 100) : 0;
+
+  // Direction via stick droit X
+  const rawS = gp.axes[2] || 0;
+  let newSteering = Math.abs(rawS) > deadzone ? Math.round(rawS * 100) : 0;
+
+  // R2 gaz / L2 frein (priorité sur les sticks si enfoncés)
+  const r2 = gp.buttons[7] ? gp.buttons[7].value : 0;
+  const l2 = gp.buttons[6] ? gp.buttons[6].value : 0;
+  if (r2 > 0.05 || l2 > 0.05) {
+    newThrottle = Math.round((r2 - l2) * 100);
   }
 
-  // Triangle = stop, Circle = mode
+  // Direction aussi via stick gauche X si stick droit pas bougé
+  if (Math.abs(newSteering) < 5) {
+    const rawSL = gp.axes[0] || 0;
+    newSteering = Math.abs(rawSL) > deadzone ? Math.round(rawSL * 100) : 0;
+  }
+
+  throttle = newThrottle;
+  steering = newSteering;
+
+  // Boutons
+  // Triangle (btn 3) = STOP
   if (gp.buttons[3]?.pressed) emergencyStop();
-  if (gp.buttons[1]?.value > 0.5 && !gp._circlePrev) { cycleMode(); }
-  gp._circlePrev = gp.buttons[1]?.value > 0.5;
-  // Cross = horn
-  sendCmd('horn', gp.buttons[0]?.pressed ? 1 : 0);
+
+  // Rond (btn 1) = changer mode (une seule fois par appui)
+  const circleNow = gp.buttons[1]?.pressed || false;
+  if (circleNow && !circlePrev) cycleMode();
+  circlePrev = circleNow;
+
+  // Croix (btn 0) = klaxon
+  if (wsConnected && ws) {
+    ws.send(JSON.stringify({ horn: gp.buttons[0]?.pressed ? 1 : 0 }));
+  }
 
   updateThrottleDisplay();
   updateSteeringDisplay();
 }
 
 // ── INIT ──
-// Show config panel on start
 setTimeout(() => toggleConfig(true), 500);
-
-// Recalculate joystick size on resize
-window.addEventListener('resize', () => {});
+// Lancer le scan tout de suite (certains navigateurs ne bloquent pas)
+startGpScan();
 </script>
 </body>
 </html>
